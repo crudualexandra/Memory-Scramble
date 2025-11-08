@@ -1,5 +1,5 @@
 // src/commands.ts
-// Problem 2 glue — tiny wrappers that call the Board (no concurrency yet)
+// Problem 2+3 glue — tiny wrappers that call the Board
 
 import { Board } from "./board.js";
 
@@ -15,7 +15,7 @@ export async function look(board: Board, playerId: string): Promise<string> {
 
 /**
  * Flip first/second depending on player state, then return a snapshot.
- * Uses the synchronous Problem-1 Board rules (no waiting).
+ * Problem 3: use async Board ops so a first flip can WAIT if the card is controlled.
  * @param board Board instance
  * @param playerId player identifier
  * @param row row index (0-based)
@@ -29,32 +29,26 @@ export async function flip(
 ): Promise<string> {
   const pos = { r: row, c: column };
   if (board.hasFirstSelection(playerId)) {
-    board.flipSecond(pos, playerId);
+    await board.flipSecondAsync(pos, playerId); // still must not wait on 2-B
   } else {
-    board.flipFirst(pos, playerId);
+    await board.flipFirstAsync(pos, playerId);  // waits if controlled by another
   }
   return board.snapshot(playerId);
 }
 
 /**
- * Stub for Problem 4 (transformer). The server passes a function,
- * but for Problem 2 we simply ignore it and return a snapshot.
- * @param board Board instance
- * @param playerId player identifier
- * @param _transform async transformer (card) => Promise<string>
+ * Stub for Problem 4 (transformer). Left as-is until Problem 4.
  */
 export async function map(
   board: Board,
-  playerId: string,
+  _playerId: string,
   _transform: (card: string) => Promise<string>
 ): Promise<string> {
-  return board.snapshot(playerId);
+  return board.snapshot(_playerId);
 }
 
 /**
- * Stub for Problem 5 (watch/long-poll). For Problem 2 we return immediately.
- * @param board Board instance
- * @param playerId player identifier
+ * Stub for Problem 5 (watch/long-poll). Will be implemented in Problem 5.
  */
 export async function watch(board: Board, playerId: string): Promise<string> {
   return board.snapshot(playerId);
