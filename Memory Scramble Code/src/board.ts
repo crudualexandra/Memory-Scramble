@@ -1,5 +1,18 @@
 // src/board.ts
-// Board ADT for Memory Scramble — Problem 1 (sync board, no waiting)
+// Board ADT for Memory Scramble — Problems 1 + 3
+// - Problem 1: synchronous rules implemented (already tested)
+// - Problem 3: add async waiting semantics for first-card flips (rule 1-D)
+//   without removing the existing sync API.
+//
+// Waiting model:
+//   • If a player tries to flip a FIRST card that is face-up and controlled by
+//     another player, we WAIT (no busy-wait) until that card becomes available
+//     (controller released or card removed). Then we retry once more.
+//   • Second-card flips DO NOT wait (per spec 2-B), they fail immediately.
+//
+// We keep all previous methods; we add flipFirstAsync/flipSecondAsync and a
+// minimal per-cell FIFO wait-queue. We also notify the queue whenever control
+// is relinquished or a card is removed, so the next waiter wakes up.
 
 import { promises as fs } from "fs";
 import * as path from "path";
@@ -17,6 +30,16 @@ type PendingOutcome =
   | { kind: "matched", first: Pos, second: Pos }
   | { kind: "mismatched", first: Pos, second: Pos }
   | null;
+
+// Tiny Deferred helper for waiting without busy loops.
+class Deferred<T> {
+  public readonly promise: Promise<T>;
+  public resolve!: (value: T | PromiseLike<T>) => void;
+  public reject!: (reason?: unknown) => void;
+  public constructor() {
+    this.promise = new Promise<T>((res, rej) => { this.resolve = res; this.reject = rej; });
+  }
+}
 
 /**
  * Mutable Board ADT.
@@ -36,6 +59,10 @@ export class Board {
   private readonly grid: (Slot | null)[][];
   private readonly firstSelection: Map<PlayerID, Pos> = new Map();
   private readonly pending: Map<PlayerID, PendingOutcome> = new Map();
+
+  // Problem 3: per-cell FIFO queues for waiters on first-card control.
+  // key = "r,c", value = array of Deferred<void> to wake in order.
+  private readonly waitQueues: Map<string, Deferred<void>[]> = new Map();
 
   private constructor(rows: number, cols: number, labels: string[]) {
     this.rows = rows;
@@ -107,13 +134,16 @@ export class Board {
       const a = outcome.first, b = outcome.second;
       this.setCell(a.r, a.c, null);
       this.setCell(b.r, b.c, null);
+      // Removing cards may wake waiters who were queued on those cells (they will see 1-A).
+      this.wakeNext(a);
+      this.wakeNext(b);
     } else {
       const { first, second } = outcome;
       for (const q of [first, second]) {
-     const cell = this.getCell(q.r, q.c);
-if (cell !== null && cell.faceUp && cell.controller === null) {
-  cell.faceUp = false;
-}
+        const cell = this.getCell(q.r, q.c);
+        if (cell !== null && cell.faceUp && cell.controller === null) {
+          cell.faceUp = false;
+        }
       }
     }
     this.pending.set(p, null);
@@ -121,7 +151,7 @@ if (cell !== null && cell.faceUp && cell.controller === null) {
   }
 
   /**
-   * First card attempt (1-A..1-D without waiting).
+   * First card attempt (1-A..1-D without waiting) — Problem 1 API (kept).
    * @param pos row/col
    * @param by player id
    */
@@ -133,9 +163,10 @@ if (cell !== null && cell.faceUp && cell.controller === null) {
 
     if (!slot.faceUp) {
       slot.faceUp = true; slot.controller = by;       // 1-B
-    } else if (slot.controller === null) {
+    } else if (slot.controller === null || slot.controller === by) {
       slot.controller = by;                           // 1-C
-    } else if (slot.controller !== by) {
+    } else {
+      // Problem 1 behavior: fail (no waiting)
       throw new Error("1-D: card is controlled by another player (no waiting in Problem 1)");
     }
     this.firstSelection.set(by, pos);
@@ -143,7 +174,7 @@ if (cell !== null && cell.faceUp && cell.controller === null) {
   }
 
   /**
-   * Second card attempt (2-A..2-E).
+   * Second card attempt (2-A..2-E) — Problem 1 API (kept).
    * @param pos row/col
    * @param by player id
    */
@@ -167,12 +198,63 @@ if (cell !== null && cell.faceUp && cell.controller === null) {
       s1.controller = by; s2.controller = by;         // 2-D
       this.pending.set(by, { kind: "matched", first, second: pos });
     } else {
-      s1.controller = null; s2.controller = null;     // 2-E
+      s1.controller = null; s2.controller = null;     // 2-E (relinquish immediately)
+      // Wake anyone waiting for control on either card.
+      this.wakeNext(first);
+      this.wakeNext(pos);
       this.pending.set(by, { kind: "mismatched", first, second: pos });
     }
 
     this.firstSelection.delete(by);
     this.checkRep();
+  }
+
+  /**
+   * Problem 3 — async version of first-card flip with waiting semantics.
+   * Waits (no busy-wait) if the card is face-up and controlled by another player.
+   * @param pos row/col
+   * @param by player id
+   */
+  public async flipFirstAsync(pos: Pos, by: PlayerID): Promise<void> {
+    this.settleBeforeNewFirstMove(by);
+
+    // try-now -> or wait -> retry once available
+    // Loop will run at most a few times because we always await a release event.
+    // If the card is removed while waiting, we will throw 1-A on retry.
+    // If another player acquires before us, we queue again and await.
+    // This is contention, not busy waiting.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const slot = this.slotAt(pos);
+      if (slot === null) throw new Error("1-A: empty space");
+
+      if (!slot.faceUp) {
+        slot.faceUp = true; slot.controller = by;     // 1-B
+        this.firstSelection.set(by, pos);
+        this.checkRep();
+        return;
+      }
+      if (slot.controller === null || slot.controller === by) {
+        slot.controller = by;                         // 1-C
+        this.firstSelection.set(by, pos);
+        this.checkRep();
+        return;
+      }
+
+      // 1-D: controlled by another → WAIT
+      await this.enqueueAndWait(pos);
+      // loop back and retry after wake
+    }
+  }
+
+  /**
+   * Problem 3 — async wrapper for second-card flip.
+   * Still MUST NOT wait per rule 2-B; simply throws on 2-A/2-B.
+   * @param pos row/col
+   * @param by player id
+   */
+  public async flipSecondAsync(pos: Pos, by: PlayerID): Promise<void> {
+    this.flipSecond(pos, by);
   }
 
   /**
@@ -199,8 +281,9 @@ if (cell !== null && cell.faceUp && cell.controller === null) {
 
   private row(r: number): (Slot | null)[] {
     const row = this.grid[r];
-if (row === undefined) throw new Error("RI: row index out of bounds");
-return row;}
+    if (row === undefined) throw new Error("RI: row index out of bounds");
+    return row;
+  }
 
   private getCell(r: number, c: number): Slot | null {
     const row = this.row(r);
@@ -225,10 +308,11 @@ return row;}
   private relinquishFirstOnly(by: PlayerID): void {
     const first = this.firstSelection.get(by);
     if (!first) return;
-   const s1 = this.slotAt(first);
-if (s1 !== null) {
-  s1.controller = null; // remain face up
-} // remain face up
+    const s1 = this.slotAt(first);
+    if (s1 !== null) {
+      s1.controller = null; // remain face up
+      this.wakeNext(first);
+    }
     this.firstSelection.delete(by);
     this.checkRep();
   }
@@ -236,8 +320,8 @@ if (s1 !== null) {
   private checkRep(): void {
     if (this.grid.length !== this.rows) throw new Error("RI: wrong row count");
     for (const row of this.grid) {
-  if (row === undefined || row.length !== this.cols) throw new Error("RI: wrong col count");
-}
+      if (row === undefined || row.length !== this.cols) throw new Error("RI: wrong col count");
+    }
 
     const cardRe = /^[^\s\n\r]+$/u;
     for (let r = 0; r < this.rows; r++) {
@@ -253,6 +337,33 @@ if (s1 !== null) {
       for (const p of [out.first, out.second]) {
         if (!this.within(p)) throw new Error("RI: pending pos OOB");
       }
+    }
+  }
+
+  // ----- Problem 3 wait-queue utilities -----
+
+  private key(p: Pos): string { return `${p.r},${p.c}`; }
+
+  // Enqueue and wait until this cell becomes available (control released or removed).
+  private enqueueAndWait(p: Pos): Promise<void> {
+    const k = this.key(p);
+    let q = this.waitQueues.get(k);
+    if (q === undefined) {
+      q = [];
+      this.waitQueues.set(k, q);
+    }
+    const d = new Deferred<void>();
+    q.push(d);
+    return d.promise;
+  }
+
+  // Wake exactly one waiter (FIFO) when a cell becomes available.
+  private wakeNext(p: Pos): void {
+    const k = this.key(p);
+    const q = this.waitQueues.get(k);
+    if (q && q.length > 0) {
+      const d = q.shift();
+      if (d) d.resolve();
     }
   }
 }
