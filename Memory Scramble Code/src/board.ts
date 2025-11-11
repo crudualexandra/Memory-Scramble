@@ -59,6 +59,8 @@ export class Board {
   private readonly grid: (Slot | null)[][];
   private readonly firstSelection: Map<PlayerID, Pos> = new Map();
   private readonly pending: Map<PlayerID, PendingOutcome> = new Map();
+  // Optional change notification hook (may be unused). If set, invoked after mutations.
+  private readonly _notify?: () => void;
 
   // Problem 3: per-cell FIFO queues for waiters on first-card control.
   // key = "r,c", value = array of Deferred<void> to wake in order.
@@ -365,5 +367,71 @@ export class Board {
       const d = q.shift();
       if (d) d.resolve();
     }
+  }
+
+  /**
+   * Problem 4: Change every non-removed card by applying an async transformer.
+   * Requirements:
+   *  - Independent of face-up/down & control (these remain unchanged).
+   *  - Operations may interleave; must never transiently break pairs that matched
+   *    at the start of this call (atomic commit per original value).
+   *  - The transformer must be a mathematical function; we call it once per
+   *    distinct original value and apply the result to all of its occurrences.
+   *  - Must reject if the transformed card value is invalid (empty or contains
+   *    whitespace), so boards remain renderable & unambiguous.
+   *
+   * @param transform async function mapping an original card label to a new label
+   * @returns resolves when all applicable cards have been updated
+   */
+  public async map(transform: (card: string) => Promise<string>): Promise<void> {
+    // === Snapshot of values and their locations at the start ===
+    const rows = this.rows;
+    const cols = this.cols;
+    const valueAt = (r: number, c: number): string | null => {
+      const cell = this.getCell(r, c);
+      return cell === null ? null : String(cell.label);
+    };
+
+    type P = { r: number; c: number };
+    const byValue = new Map<string, P[]>();
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const v = valueAt(r, c);
+        if (v === null) continue; // removed
+        const list = byValue.get(v) ?? [];
+        list.push({ r, c });
+        byValue.set(v, list);
+      }
+    }
+
+    // === Compute transformed values once per distinct original ===
+    const entries = [...byValue.entries()];
+    const results = await Promise.all(entries.map(async ([orig]) => {
+      const out = await transform(orig);
+      // Validate transformed card (no empty & no whitespace)
+      if (typeof out !== "string" || out.length === 0 || out.trim() !== out || /\s/.test(out)) {
+        throw new Error("invalid transformed card");
+      }
+      return [orig, out] as const;
+    }));
+
+    const mapping = new Map<string, string>(results);
+
+    // === Commit per-orig-value atomically so pairs never go out of sync ===
+    for (const [orig, positions] of entries) {
+      const newVal = mapping.get(orig);
+      if (newVal === undefined) continue; // should not happen
+      for (const { r, c } of positions) {
+        // If cell was removed in the meantime, skip; interleaving allowed.
+        const cell = this.getCell(r, c);
+        if (cell === null) continue;
+        cell.label = newVal;
+      }
+    }
+
+    // Optional notify if watchers exist
+    this._notify?.();
+    this.checkRep();
   }
 }
