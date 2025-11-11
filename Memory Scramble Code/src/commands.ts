@@ -47,6 +47,25 @@ export async function map(
   return board.snapshot(_playerId);
 }
 
+// Glue for Problem 4: simply delegates to board.map(). If board.mapCards exists use it instead.
+/**
+ * Apply async transform to all non-removed cards. Player identity is ignored for map.
+ * @param board Board instance
+ * @param _playerId ignored (map independent of player)
+ * @param transform async (card) => newCard
+ */
+/**
+ * Apply async transform to all non-removed cards. Player identity is ignored for map.
+ * @param board Board instance
+ * @param _playerId ignored (map independent of player)
+ * @param transform async (card) => newCard
+ * @returns resolves when mapping is complete
+ */
+export async function mapTransform(board: Board, _playerId: string, transform: (card: string) => Promise<string>): Promise<void> {
+  // Board now implements map(); simply delegate.
+  await board.map(transform);
+}
+
 /**
  * Stub for Problem 5 (watch/long-poll). Will be implemented in Problem 5.
  */
